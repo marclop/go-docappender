@@ -80,8 +80,16 @@ type Appender struct {
 
 	scalingInfo atomic.Value
 
-	config                Config
-	available             chan *BulkIndexer
+	config Config
+	// availableBulkRequests is a buffered channel of available bulk indexers.
+	// When a bulk indexer is needed, it is taken from this channel, unless
+	// the hot channel channel has one or more bulk indexers available.
+	available chan *BulkIndexer
+	// hot is a buffered channel of recently used bulk indexers. This is useful
+	// for two reasons; 1) to reduce memory usage when the appender isn't being
+	// used in a high-throughput manner, and 2) since the bulk indexers store
+	// previously failed documents, it allows for a more localized retry.
+	hot                   chan *BulkIndexer
 	bulkItems             chan BulkIndexerItem
 	errgroup              errgroup.Group
 	errgroupContext       context.Context
@@ -175,6 +183,7 @@ func New(client esapi.Transport, cfg Config) (*Appender, error) {
 		config:    cfg,
 		available: available,
 		closed:    make(chan struct{}),
+		hot:       make(chan *BulkIndexer, cfg.MaxRequests),
 		bulkItems: make(chan BulkIndexerItem, cfg.DocumentBufferSize),
 		metrics:   ms,
 	}
@@ -222,15 +231,36 @@ func (a *Appender) Close(ctx context.Context) error {
 		<-ctx.Done()
 	}()
 
+	// Wait for all flushes to complete.
 	if err := a.errgroup.Wait(); err != nil {
 		return err
 	}
+	close(a.hot)
 	close(a.available)
 	var errs []error
-	for bi := range a.available {
-		if err := a.flush(context.Background(), bi); err != nil {
-			errs = append(errs, fmt.Errorf("indexer failed: %w", err))
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(a.available))
+	finalFlush := func(c <-chan *BulkIndexer) {
+		for bi := range c {
+			if bi.Items() == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := a.flush(context.Background(), bi); err != nil {
+					errChan <- fmt.Errorf("indexer failed: %w", err)
+				}
+			}()
 		}
+	}
+	for _, v := range []chan *BulkIndexer{a.hot, a.available} {
+		finalFlush(v)
+	}
+	wg.Wait()
+	close(errChan)
+	for err := range errChan {
+		errs = append(errs, err)
 	}
 	if len(errs) != 0 {
 		return fmt.Errorf("failed to flush events on close: %w", errors.Join(errs...))
@@ -266,6 +296,32 @@ func (a *Appender) Stats() Stats {
 // The document io.WriterTo will be accessed after Add returns, and must remain
 // accessible until its Read method returns EOF, or its WriterTo method returns.
 func (a *Appender) Add(ctx context.Context, index string, document io.WriterTo) error {
+	return a.add(ctx, index, document, nil)
+}
+
+// AddWithCallback enqueues document for appending to index with a callback.
+// The callback will be called after the document has been successfully indexed,
+// which, depending on the configuration, Elasticsearch response latency, and
+// the number of documents in the buffer, may be some time after AddWithCallback.
+//
+// The document body will be copied to a buffer using io.Copy, and document may
+// implement io.WriterTo to reduce overhead of copying.
+//
+// The document io.WriterTo will be accessed after Add returns, and must remain
+// accessible until its Read method returns EOF, or its WriterTo method returns.
+func (a *Appender) AddWithCallback(ctx context.Context,
+	index string,
+	document io.WriterTo,
+	callback func(),
+) error {
+	return a.add(ctx, index, document, callback)
+}
+
+func (a *Appender) add(ctx context.Context,
+	index string,
+	document io.WriterTo,
+	callback func(),
+) error {
 	if index == "" {
 		return errMissingIndex
 	}
@@ -277,8 +333,9 @@ func (a *Appender) Add(ctx context.Context, index string, document io.WriterTo) 
 	// documents to be processed by an active bulk indexer in a dedicated
 	// goroutine, improving data locality and minimising lock contention.
 	item := BulkIndexerItem{
-		Index: index,
-		Body:  document,
+		Index:    index,
+		Body:     document,
+		Callback: callback,
 	}
 	if len(a.bulkItems) == cap(a.bulkItems) {
 		a.addCount(1, &a.blockedAdd, a.metrics.blockedAdd)
@@ -495,6 +552,26 @@ func (a *Appender) flush(ctx context.Context, bulkIndexer *BulkIndexer) error {
 	return nil
 }
 
+// getIndexer returns a bulk indexer from the hot channel if available, otherwise
+// it will return a bulk indexer from the available channel. This method is
+// blocking until a bulk indexer is available.
+//
+// The hot channel is used to reduce memory usage when the appender isn't being
+// used in a high-throughput manner, and to allow for more localized retries.
+func (a *Appender) getIndexer() (bi *BulkIndexer) {
+	t := time.NewTimer(time.Millisecond)
+	defer t.Stop()
+	select {
+	case bi = <-a.hot:
+	case <-t.C:
+		select {
+		case bi = <-a.hot:
+		case bi = <-a.available:
+		}
+	}
+	return bi
+}
+
 // runActiveIndexer starts a new active indexer which pulls items from the
 // bulkItems channel. The more active indexers there are, the faster items
 // will be pulled out of the queue, but also the more likely it is that the
@@ -515,7 +592,7 @@ func (a *Appender) runActiveIndexer() {
 			// NOTE(marclop) Record the TS when the first document is cached.
 			// It doesn't account for the time spent in the buffered channel.
 			firstDocTS = time.Now()
-			active = <-a.available
+			active = a.getIndexer()
 			a.addUpDownCount(-1, &a.availableBulkRequests, a.metrics.availableBulkRequests)
 			flushTimer.Reset(a.config.FlushInterval)
 		}
@@ -578,7 +655,9 @@ func (a *Appender) runActiveIndexer() {
 					err = a.flush(a.errgroupContext, indexer)
 				})
 				indexer.Reset()
-				a.available <- indexer
+				// Since the indexer has already been used, return it to the
+				// hot channel to reduce memory usage.
+				a.hot <- indexer
 				a.addUpDownCount(1, &a.availableBulkRequests, a.metrics.availableBulkRequests)
 				a.metrics.flushDuration.Record(context.Background(), took.Seconds(),
 					attrs,

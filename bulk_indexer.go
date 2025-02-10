@@ -97,7 +97,16 @@ type BulkIndexer struct {
 	copyBuf            []byte
 	buf                bytes.Buffer
 	retryCounts        map[int]int
-	requireDataStream  bool
+	// indexDocumentCallbacks tracks document positions with their callbacks.
+	// This is used to acknowledge processed documents. Processed documents are
+	// defined as documents that have been successfully indexed, have reached
+	// the maximum number of retries or have failed terminally (e.g. non-429).
+	indexDocumentCallbacks map[int]func()
+	// exceptions tracks document positions that should not be acknowledged. In
+	// practice, this will only happen when document retries are enabled. Since
+	// the rest of the errors are treated as terminal, and aren't retried.
+	exceptions        map[int]int
+	requireDataStream bool
 }
 
 type BulkIndexerResponseStat struct {
@@ -214,9 +223,11 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (*BulkIndexer, error) {
 	}
 
 	b := &BulkIndexer{
-		config:            cfg,
-		retryCounts:       make(map[int]int),
-		requireDataStream: cfg.RequireDataStream,
+		config:                 cfg,
+		retryCounts:            make(map[int]int),
+		indexDocumentCallbacks: make(map[int]func(), 4096),
+		exceptions:             make(map[int]int),
+		requireDataStream:      cfg.RequireDataStream,
 	}
 
 	// use a len check instead of a nil check because document level retries
@@ -282,6 +293,11 @@ type BulkIndexerItem struct {
 	Pipeline         string
 	Body             io.WriterTo
 	DynamicTemplates map[string]string
+	// Callback is called when the document is processed. Processed documents
+	// are defined as documents that have been successfully indexed, have
+	// reached the maximum number of retries or have failed terminally (e.g.
+	// non-429 or 5xx status codes).
+	Callback func()
 }
 
 // Add encodes an item in the buffer.
@@ -292,6 +308,9 @@ func (b *BulkIndexer) Add(item BulkIndexerItem) error {
 	}
 	if _, err := b.writer.Write([]byte("\n")); err != nil {
 		return fmt.Errorf("failed to write newline: %w", err)
+	}
+	if item.Callback != nil {
+		b.indexDocumentCallbacks[b.itemsAdded] = item.Callback
 	}
 	b.itemsAdded++
 	return nil
@@ -349,7 +368,10 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 	if b.itemsAdded == 0 {
 		return BulkIndexerResponseStat{}, nil
 	}
-
+	// Exceptions contains the positions that should not be acknowledged. In
+	// practice, this will only happen when document retries are enabled. Since
+	// the rest of the errors are treated as terminal, and aren't retried.
+	defer func() { b.callbackExcept() }()
 	if b.gzipw != nil {
 		if err := b.gzipw.Close(); err != nil {
 			return BulkIndexerResponseStat{}, fmt.Errorf("failed closing the gzip writer: %w", err)
@@ -571,6 +593,9 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 					lastIdx += endIdx
 				}
 
+				// Do not ack retriable, and shift the position to the buffer
+				// position that the document will be written to.
+				b.exceptions[res.Position] = b.itemsAdded
 				resp.RetriedDocs++
 				b.itemsAdded++
 			} else {
@@ -584,7 +609,6 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 		// - retriable errors that reached the retry limit
 		resp.FailedDocs = tmp
 	}
-
 	return resp, nil
 }
 
@@ -595,6 +619,31 @@ func (b *BulkIndexer) shouldRetryOnStatus(docStatus int) bool {
 		}
 	}
 	return false
+}
+
+// callbackExcept calls the indexDocumentCallbacks except for the ones present
+// in the exceptions map. This is used to acknowledge processed documents.
+func (b *BulkIndexer) callbackExcept() {
+	callbacks := len(b.indexDocumentCallbacks)
+	for position := 0; position < callbacks; position++ {
+		shift, hasException := b.exceptions[position]
+		callback, _ := b.indexDocumentCallbacks[position]
+		if callback == nil {
+			continue // This is unlikely, but better be safe than panic.
+		}
+		if hasException {
+			// The callback should not be called for this document if it's
+			// marked as an exception, since it'll be retried later on.
+			if shift != position {
+				// shift the callback to the new position
+				b.indexDocumentCallbacks[shift] = callback
+			}
+			delete(b.exceptions, position) // Delete the exception.
+			continue                       // Keep iterating.
+		}
+		callback()
+		delete(b.indexDocumentCallbacks, position) // Delete executed callback.
+	}
 }
 
 // indexnth returns the index of the nth instance of sep in s.

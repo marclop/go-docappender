@@ -44,6 +44,7 @@ func TestBulkIndexer(t *testing.T) {
 	} {
 		t.Run(tc.Name, func(t *testing.T) {
 			var esFailing atomic.Bool
+			var callbackCalledCount atomic.Int64
 			client := docappendertest.NewMockElasticsearchClient(t, func(w http.ResponseWriter, r *http.Request) {
 				_, result := docappendertest.DecodeBulkRequest(r)
 				if esFailing.Load() {
@@ -74,6 +75,7 @@ func TestBulkIndexer(t *testing.T) {
 						Body: newJSONReader(map[string]any{
 							"@timestamp": time.Now().Format(docappendertest.TimestampFormat),
 						}),
+						Callback: func() { callbackCalledCount.Add(1) },
 					}))
 				}
 			}
@@ -92,6 +94,9 @@ func TestBulkIndexer(t *testing.T) {
 			// nothing is in the buffer if all succeeded
 			require.Equal(t, 0, indexer.Len())
 			require.Equal(t, 0, indexer.UncompressedLen())
+			// Ensure all item's callbacks are called.
+			require.Equal(t, int64(itemCount), callbackCalledCount.Load())
+			initialItemCount := int64(itemCount)
 
 			// Simulate ES failure, all items should be enqueued for retries
 			esFailing.Store(true)
@@ -104,6 +109,8 @@ func TestBulkIndexer(t *testing.T) {
 				require.Equal(t, int64(0), stat.Indexed)
 				require.Len(t, stat.FailedDocs, 0)
 				require.Equal(t, int64(itemCount), stat.RetriedDocs)
+				// Ensure callbacks aren't called for failed items.
+				require.Equal(t, initialItemCount, callbackCalledCount.Load())
 
 				// all the flushed bytes are now in the buffer again to be retried
 				require.Equal(t, indexer.UncompressedLen(), indexer.BytesUncompressedFlushed())
@@ -125,6 +132,9 @@ func TestBulkIndexer(t *testing.T) {
 			// no documents to retry so buffer should be empty
 			require.Equal(t, 0, indexer.Len())
 			require.Equal(t, 0, indexer.UncompressedLen())
+			// The total callbacks called are initialItemCount + itemCount,
+			// since 429s are retried.
+			require.Equal(t, initialItemCount+int64(itemCount), callbackCalledCount.Load())
 		})
 	}
 }

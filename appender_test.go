@@ -264,9 +264,12 @@ func TestAppenderRetry(t *testing.T) {
 	require.NoError(t, err)
 	defer indexer.Close(context.Background())
 
+	var callbackCalledCount atomic.Int64
 	const N = 10
 	for i := 0; i < N; i++ {
-		addMinimalDoc(t, indexer, "logs-foo-testing")
+		addWithCallbackMinimalDoc(t, indexer, "logs-foo-testing", func() {
+			callbackCalledCount.Add(1)
+		})
 	}
 
 	timeout := time.After(2 * time.Second)
@@ -371,6 +374,9 @@ loop:
 		BytesTotal:             bytesTotal,
 		BytesUncompressedTotal: bytesUncompressed,
 	}, stats)
+	// Ensure that the callbacks match the number of documents added. This
+	// includes the failed documents documents, but not the retried documents.
+	assert.Equal(t, int64(N), callbackCalledCount.Load())
 }
 
 func TestAppenderAvailableAppenders(t *testing.T) {
@@ -1756,6 +1762,15 @@ func addMinimalDoc(t testing.TB, indexer *docappender.Appender, index string) {
 	err := indexer.Add(context.Background(), index, newJSONReader(map[string]any{
 		"@timestamp": time.Now().Format(docappendertest.TimestampFormat),
 	}))
+	require.NoError(t, err)
+}
+
+func addWithCallbackMinimalDoc(t testing.TB, indexer *docappender.Appender, index string, cb func()) {
+	err := indexer.AddWithCallback(context.Background(),
+		index, newJSONReader(map[string]any{
+			"@timestamp": time.Now().Format(docappendertest.TimestampFormat),
+		}), cb,
+	)
 	require.NoError(t, err)
 }
 
